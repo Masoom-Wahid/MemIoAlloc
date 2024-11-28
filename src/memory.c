@@ -65,6 +65,8 @@ uint8_t *update_ptr(uint8_t *ptr){
 	return new_ptr;
 }
 
+
+
 void* mem_io_malloc(size_t size){
 	pthread_mutex_lock(&mem_lock);
 	if (mem_io.is_init == false){
@@ -100,15 +102,39 @@ void* mem_io_malloc(size_t size){
 			//printf("UPDATE_PTR %p\n",curr_ptr);
 			continue;
 		}
+		
 
+		size_t curr_ptr_size = (size_t)*(curr_ptr + MEM_IO_SIZE_OFFSET);
+		bool prev_used = false;
 
 		if(*(curr_ptr + MEM_IO_USED_OFFSET) == MEM_IO_ON){
-			bool is_enough_size = *(curr_ptr + MEM_IO_SIZE_OFFSET) >= size;
+			bool is_enough_size = curr_ptr_size >= size;
 			//printf("is_enough_size %d\n",is_enough_size);
 			if (!is_enough_size) {
 				curr_ptr = update_ptr(curr_ptr);
 				continue;
-			} 
+			}
+
+			prev_used = true;
+
+		}
+
+
+		/*
+		 * 0-11 header
+		 * 11-59
+		 * 0 48 1
+		 * 1 10
+		 */
+		if (prev_used && curr_ptr_size > size && (curr_ptr_size-size) > 12){
+			size_t size_diff = curr_ptr_size-size;
+			uint8_t *new_segmented_ptr = curr_ptr + MEM_IO_HEADER_SIZE + size;
+			size_t abs_size_diff = size_diff - MEM_IO_HEADER_SIZE;
+
+
+			*(new_segmented_ptr + MEM_IO_ON_OFFSET) = MEM_IO_OFF;
+			*(new_segmented_ptr + MEM_IO_SIZE_OFFSET) = abs_size_diff;
+			*(new_segmented_ptr + MEM_IO_USED_OFFSET) = MEM_IO_OFF;
 		}
 
 
@@ -144,24 +170,52 @@ void* mem_io_malloc(size_t size){
 	return return_pointer;
 }
 
+void mem_io_free(void* _addr) {
+    pthread_mutex_lock(&mem_lock);
+    //mem_io_log_trace();
+    uint8_t* addr = (uint8_t*)_addr;
+    //uint8_t* prev_block = NULL;
+    uint8_t* next_block = NULL;
 
+    /*
+     * get the pointer to the curr memory's header block
+    */
+    uint8_t* block_header = addr - MEM_IO_HEADER_SIZE;
 
-void mem_io_free(void* _addr){
-	pthread_mutex_lock(&mem_lock);
-	uint8_t* addr = (uint8_t*)_addr;
+    if (*(block_header + MEM_IO_ON_OFFSET) == MEM_IO_OFF) {
+        pthread_mutex_unlock(&mem_lock);
+        return;
+    }
 
-	if(*(addr - MEM_IO_HEADER_SIZE) == MEM_IO_OFF){
-		pthread_mutex_unlock(&mem_lock);
-		return;
-	}
+    *(block_header + MEM_IO_ON_OFFSET) = MEM_IO_OFF;
 
-	*(addr- MEM_IO_HEADER_SIZE) = MEM_IO_OFF;
-	mem_io.count -= 1;
-	mem_io.deallocated += 1;
-	pthread_mutex_unlock(&mem_lock);
+    size_t block_size = (size_t)*(block_header + MEM_IO_SIZE_OFFSET);
+    /*
+	if (block_header > mem_io.head) {
+        prev_block = block_header - MEM_IO_HEADER_SIZE - *(size_t*)(block_header - MEM_IO_HEADER_SIZE + MEM_IO_SIZE_OFFSET);
+	printf("prev_block pointer %p\n",prev_block);
 
-	return;
+	if (*(prev_block + MEM_IO_ON_OFFSET) == MEM_IO_OFF) {
+            size_t prev_block_size = (size_t)*(prev_block + MEM_IO_SIZE_OFFSET);
+            *(prev_block + MEM_IO_SIZE_OFFSET) = prev_block_size + block_size;
+        }
+    }
+	*/
+    next_block = block_header + block_size + MEM_IO_HEADER_SIZE;
+    //printf("next_block pointer %p\n",next_block);
+    //printf("next_block == NULL %d\n",next_block==NULL);
+    if (next_block != NULL && *(next_block + MEM_IO_ON_OFFSET) == MEM_IO_OFF) {
+        size_t next_block_size = (size_t)*(next_block + MEM_IO_SIZE_OFFSET);
+        *(block_header + MEM_IO_SIZE_OFFSET) = block_size + next_block_size;
+    }
+
+    mem_io.count -= 1;
+    mem_io.deallocated += 1;
+    pthread_mutex_unlock(&mem_lock);
+    return;
 }
+
+
 
 void mem_io_log_trace(){
 	printf(
