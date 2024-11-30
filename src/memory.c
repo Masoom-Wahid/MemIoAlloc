@@ -31,16 +31,16 @@ pthread_mutex_t mem_lock = PTHREAD_MUTEX_INITIALIZER;
 * to adjust to a page ??
 */
 void __mem_io_alloc(size_t size){
-	size_t allocation_size = ALIGN(size + sizeof(mem_io_block)); 
-	size_t *new_break = (size_t*)sbrk(allocation_size); 
-	size_t size_diff = (size_t)(new_break - mem_io.heap);
-	if (new_break == (void*) -1) {
-		perror("sbrk failed");
-		exit(EXIT_FAILURE);
-	}
-	mem_io.total_size += size_diff; 
-	mem_io.heap = new_break;
+    size_t allocation_size = ALIGN(size > MEM_IO_PAGE ? size : MEM_IO_PAGE); 
+    if (sbrk(allocation_size) == (void *) -1) {
+        perror("sbrk failed");
+        exit(EXIT_FAILURE);
+    }
+    mem_io.heap_end = (uint8_t*)sbrk(0);
+    mem_io.total_size += allocation_size; 
 }
+
+
 
 
 
@@ -50,10 +50,9 @@ void __mem_io_alloc(size_t size){
 */
 void __mem_io_init_pool(){
 	mem_io.is_init=true;
-	size_t* curr_break = (size_t*)sbrk(0);
-	
-	mem_io.seg_break = curr_break+1;
-	mem_io.heap = curr_break+1;
+	uint8_t* curr_break = (uint8_t*)sbrk(0);
+	mem_io.heap_end = curr_break;
+	mem_io.heap_start = curr_break;
 	mem_io.head = NULL;
 	mem_io.total_size = 0;
 	mem_io.free_size = 0;
@@ -69,13 +68,12 @@ void __mem_io_init_pool(){
 
 
 
-void __init_block(mem_io_block *block,size_t* next,size_t *prev,size_t size){
+void __init_block(mem_io_block *block,uint8_t* next,uint8_t *prev,size_t size){
 	block->size = size;
 	block->next = next; 
 	block->prev = prev;
 	block->flags = MEM_IO_FLAG_USED;
 	block->magic = MEM_IO_MAGIC_NUMBER;
-
 }
 
 
@@ -94,10 +92,10 @@ void __split_block(mem_io_block *block,size_t size){
 	__init_block(
 		new_block,
 		block->next,
-		(size_t*)block,
+		(uint8_t*)block,
 		(block->size-size)-sizeof(mem_io_block)
 	);
-	block->next = (size_t*)new_block;
+	block->next = (uint8_t*)new_block;
 	block->size = size;
 	new_block->flags = MEM_IO_FLAG_FREE;
 }
@@ -110,6 +108,13 @@ void __merge_blocks(mem_io_block* block_1,mem_io_block *block_2){
 	size_t block_total_size = block_1->size+sizeof(mem_io_block)+block_2->size;
 	block_1->next = block_2->next;
 	block_1->size = block_total_size;
+
+	// change the next guy (block_2)'s next to look at me(block_1) 
+	if(block_2->next != NULL){
+		((mem_io_block*)block_2->next)->prev = (uint8_t*)block_1;
+	}
+	block_1->flags = MEM_IO_FLAG_FREE;
+
 }
 
 
@@ -152,62 +157,78 @@ void block_debug(mem_io_block *block) {
 * to take for ourselves we shall feast on the new memory given to us by kernel
 */
 void* mem_io_malloc(size_t size){
+	if(size == 0) return NULL;
+
 	pthread_mutex_lock(&mem_lock);
 	if (!mem_io.is_init) __mem_io_init_pool();
+	
 
+	size = ALIGN(size);
 	mem_io_block *curr_ptr = mem_io.head;
-	mem_io_block *prev_ptr = mem_io.head;
-	bool is_head_null = curr_ptr == NULL;
-
-
-	while(1){
-		// if we have reached the end of our journey , we shall expand , aint no way we stopping
-		if((size_t *)curr_ptr == mem_io.seg_break)  __mem_io_alloc(size);
-
-
-		if (curr_ptr == NULL){
-			mem_io_block *new_block = (mem_io_block *)mem_io.heap;
-			__init_block(new_block,NULL,NULL,size);
-			
-
-			if(is_head_null){ 
-				mem_io.head = new_block;
-			}else{
-				new_block->prev = (size_t*)prev_ptr; 
-				prev_ptr->next = (size_t*)new_block;
-			}
-
-
-			ADVANCE_HEAP_POINTER(mem_io.heap,size);
-			curr_ptr = new_block;
-			break;
-		}
+	mem_io_block *prev_ptr = NULL;
+	
+	if(size >= MEM_IO_MMAP_THRESHOLD){
+		size_t allocation_size = ALIGN(size + sizeof(mem_io_block)+ MEM_IO_PAGE);
+		mem_io_block* new_block = mmap(
+			NULL,
+			allocation_size,
+			PROT_READ | PROT_WRITE,
+			MAP_PRIVATE | MAP_ANONYMOUS,
+			-1,
+			0
+		);
 		
-
-
-		// if it aint null , cast it as a block
-		mem_io_block *curr_block = curr_ptr; 
-		if (IS_MEM_IO_FLAG_USED(curr_block->flags)|| curr_block->size < size){
-			prev_ptr = curr_ptr;
-			curr_ptr = (mem_io_block*)curr_block->next;
-			continue;
+		if(new_block == MAP_FAILED){
+			perror("mmap failed");
+			return NULL;
 		}
 
-		bool should_segment = curr_block->size  > (size + sizeof(mem_io_block));
-		if(should_segment) __split_block(curr_block,size);
-		
-		__init_block(curr_block,curr_block->next,curr_block->prev,size);
-
-		curr_ptr = curr_block; 
-		break;
+		__init_block(new_block,NULL,NULL,size);
+		new_block->flags = MEM_IO_FLAG_USED | MEM_IO_FLAG_MMAP;
+		mem_io.allocated++;
+		mem_io.count++;
+		pthread_mutex_unlock(&mem_lock);
+		return (void*)((uint8_t*)new_block + sizeof(mem_io_block));
 	}
 
-	void* return_pointer = (void*)curr_ptr+sizeof(mem_io_block);
+	while(curr_ptr != NULL){
+		if(!IS_MEM_IO_FLAG_USED(curr_ptr->flags) && curr_ptr->size >= size){
+			if(curr_ptr->size >= size + sizeof(mem_io_block) + MINIMUM_ALLOC_SIZE){
+				__split_block(curr_ptr,size);
+			}
+			curr_ptr->flags = MEM_IO_FLAG_USED;
+			mem_io.allocated++;
+			mem_io.count++;
+			pthread_mutex_unlock(&mem_lock);
+			return (void*)((uint8_t*)curr_ptr + sizeof(mem_io_block));
+		}
+
+		prev_ptr = curr_ptr;
+		curr_ptr = (mem_io_block*)curr_ptr->next;
+	}
+	
+	uint8_t* block_address = mem_io.heap_end;
+	size_t total_size = sizeof(mem_io_block) + size;
+
+
+	if(block_address + total_size > mem_io.heap_end){
+		__mem_io_alloc(total_size);
+	}
+	mem_io_block* new_block = (mem_io_block*)block_address;
+	__init_block(new_block, NULL, (uint8_t*)prev_ptr, size);
+
+	if (prev_ptr != NULL){
+		prev_ptr->next = (uint8_t*)new_block;
+	}else {
+		mem_io.head = new_block; 
+	}
+
+	mem_io.heap_end += total_size;
+
 	mem_io.allocated++;
 	mem_io.count++;
-
 	pthread_mutex_unlock(&mem_lock);
-	return return_pointer;
+	return (void*)((uint8_t*)new_block + sizeof(mem_io_block));
 }
 
 
@@ -229,7 +250,7 @@ void* mem_io_malloc(size_t size){
 */
 void mem_io_free(void* _addr) {
     pthread_mutex_lock(&mem_lock);
-    mem_io_block* block = (mem_io_block*)(_addr-sizeof(mem_io_block));
+    mem_io_block* block = (mem_io_block*)((uint8_t*)_addr-sizeof(mem_io_block));
     
     // TODO: maybe a process to cleanup corrupt memeory too ?
     bool is_block_valid = VALIDATE_BLOCK(block);
@@ -241,6 +262,19 @@ void mem_io_free(void* _addr) {
 	pthread_mutex_unlock(&mem_lock);
 	return;	
      }
+
+
+   if(IS_MEM_IO_FLAG_MMAP(block->flags)){
+	size_t allocation_size = ALIGN(block->size + sizeof(mem_io_block) + MEM_IO_PAGE);
+        if (munmap(block, allocation_size) == -1) {
+		perror("munmap failed");
+                mem_io.errors++;
+            }
+	pthread_mutex_unlock(&mem_lock);
+	return;
+	
+
+    } 
 
     mem_io_block* prev_block = (mem_io_block*) block->prev;
     mem_io_block* next_block = (mem_io_block*) block->next; 
@@ -286,6 +320,7 @@ void* mem_io_realloc(void* _addr,size_t size){
 	}
 	
 	pthread_mutex_lock(&mem_lock);
+	size = ALIGN(size);
 	mem_io_block* block = (mem_io_block*)((uint8_t*)_addr-sizeof(mem_io_block));
 
 	bool is_block_valid = VALIDATE_BLOCK(block);
@@ -295,25 +330,48 @@ void* mem_io_realloc(void* _addr,size_t size){
 		return NULL; 
 	}
 
-	if(size > block->size){
-		pthread_mutex_unlock(&mem_lock);
 
-		void *allocated_memory = mem_io_malloc(size);
-		memcpy(
-			allocated_memory,
-			(uint8_t* )block+sizeof(mem_io_block),
-			block->size
-		);
-		mem_io_free(_addr);
-		return allocated_memory;
+
+	if(IS_MEM_IO_FLAG_MMAP(block->flags)){
+		perror("hell nah man , we aint reallocating for mmap. free and malloc that is the way\n");
+		pthread_mutex_unlock(&mem_lock);
+		exit(EXIT_FAILURE);
+		return NULL;
+	}
+	if(size > block->size){
+		mem_io_block* next_block = (mem_io_block*)block->next;
+		while(next_block && IS_MEM_IO_FLAG_FREE(next_block->flags)){
+				__merge_blocks(block, next_block);
+				next_block = (mem_io_block*)next_block->next;
+				if(block->size>=size) break;
+		}
+
+		if(block->size >= size){
+			pthread_mutex_unlock(&mem_lock);
+			return _addr;
+		}
+		else {
+			// Allocate new block and copy data
+			pthread_mutex_unlock(&mem_lock);
+			void *allocated_memory = mem_io_malloc(size);
+			memcpy(
+				allocated_memory,
+				(uint8_t* )block+sizeof(mem_io_block),
+				block->size
+			);
+			mem_io_free(_addr);
+			return allocated_memory;	
+			}		
 	// if the size isnt big enough to store the header for the next block then we dont really
 	// need to split , cause it aint of any use
-	}else if (size < block->size && (block->size - size) > sizeof(mem_io_block) ){
-		__split_block(block,size);
+	}else if (size < block->size){
+		if (block->size - size >= sizeof(mem_io_block) + MINIMUM_ALLOC_SIZE){
+		    __split_block(block, size);
+		}
 	}
-	
+
+	// nothing happended we just return
 	pthread_mutex_unlock(&mem_lock);
-	// if now realloc is needed then we are good
 	return _addr;
 }
 
@@ -328,9 +386,9 @@ void mem_io_stack_trace(){
 
 void mem_io_log_trace(){
 	printf(
-	"\n\n\nDEBUG INFO:\n\nseg_break: %p\nheap: %p\nhead: %p\ncount: %ld\nallocated: %d\ndeallocated: %d\n\n\n",
-	mem_io.seg_break,
-	mem_io.heap,
+	"\n\n\nDEBUG INFO:\n\nheap_end: %p\nheap_start: %p\nhead: %p\ncount: %ld\nallocated: %ld\ndeallocated: %ld\n\n\n",
+	mem_io.heap_end,
+	mem_io.heap_start,
 	mem_io.head,
 	mem_io.count,
 	mem_io.allocated,
