@@ -2,7 +2,7 @@
 
 ## Overview
 
-`mem_io` is a custom memory allocator implemented in C, providing functionality similar to the standard `malloc`, `free`, and `realloc` functions. It is designed for educational purposes to demonstrate how memory management works at a low level in C programming. The allocator manages its own heap space and includes features like splitting and merging memory blocks to reduce fragmentation, thread safety with mutex locks, and debugging tools to trace memory usage.
+`mem_io` is a custom memory allocator implemented in C, providing functionality similar to the standard `malloc`, `free`, and `realloc` functions. It is designed for learning purposes for myself to understand how memory management works at a low level in C programming. The allocator manages its own heap space and includes features like splitting and merging memory blocks to reduce fragmentation, thread safety with mutex locks, and debugging tools to trace memory usage.
 
 ## Features
 
